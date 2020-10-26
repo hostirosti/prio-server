@@ -14,8 +14,6 @@ variable "sum_part_bucket_service_account_email" {
   type = string
 }
 
-data "aws_caller_identity" "current" {}
-
 # Make a bucket where we will store global and specific manifests and from which
 # peers can fetch them.
 # https://cloud.google.com/cdn/docs/setting-up-cdn-with-bucket
@@ -57,7 +55,6 @@ resource "google_storage_bucket_object" "global_manifest" {
   content = jsonencode({
     format = 0
     server-identity = {
-      aws-account-id            = tonumber(data.aws_caller_identity.current.account_id)
       gcp-service-account-email = var.sum_part_bucket_service_account_email
     }
   })
@@ -89,6 +86,7 @@ data "google_dns_managed_zone" "manifests" {
 # Create an A record from which this env's manifests will be served.
 resource "google_dns_record_set" "manifests" {
   provider     = google-beta
+  project      = var.managed_dns_zone.gcp_project
   name         = local.domain_name
   managed_zone = data.google_dns_managed_zone.manifests.name
   type         = "A"

@@ -20,7 +20,7 @@ variable "workflow_manager_image" {
 
 variable "workflow_manager_version" {
   type    = string
-  default = "0.1.0"
+  default = "0.1.1"
 }
 
 variable "gcp_project" {
@@ -31,7 +31,11 @@ variable "ingestion_bucket" {
   type = string
 }
 
-variable "ingestion_bucket_role" {
+variable "s3_writer_role_to_assume" {
+  type = string
+}
+
+variable "s3_writer_account_to_assume" {
   type = string
 }
 
@@ -42,8 +46,6 @@ variable "kubernetes_namespace" {
 variable "packet_decryption_key_kubernetes_secret" {
   type = string
 }
-
-data "aws_caller_identity" "current" {}
 
 # Workload identity[1] lets us map GCP service accounts to Kubernetes service
 # accounts. We need this so that pods can use GCP API, but also AWS APIs like S3
@@ -163,20 +165,19 @@ resource "kubernetes_cron_job" "workflow_manager" {
               # Write sample data to exercise writing into S3.
               args = [
                 "generate-ingestion-sample",
-                "--s3-use-credentials-from-gke-metadata",
                 "--aggregation-id", "fake-1",
                 "--batch-id", "eb03ef04-5f05-4a64-95b2-ca1b841b6885",
                 "--date", "2020/09/11/21/11",
-                "--facilitator-output", "s3://${var.ingestion_bucket}",
+                "--facilitator-output", "/tmp/sample-facilitator",
                 "--pha-output", "/tmp/sample-pha"
               ]
               env {
                 name  = "AWS_ROLE_ARN"
-                value = var.ingestion_bucket_role
+                value = var.s3_writer_role_to_assume
               }
               env {
                 name  = "AWS_ACCOUNT_ID"
-                value = data.aws_caller_identity.current.account_id
+                value = var.s3_writer_account_to_assume
               }
               env {
                 name = "BATCH_SIGNING_KEY"

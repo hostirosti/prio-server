@@ -10,15 +10,6 @@ variable "gcp_project" {
   type = string
 }
 
-variable "aws_region" {
-  type = string
-}
-
-variable "aws_profile" {
-  type    = string
-  default = "leuswest2"
-}
-
 variable "machine_type" {
   type    = string
   default = "e2.small"
@@ -75,14 +66,6 @@ provider "google-beta" {
   # https://www.terraform.io/docs/providers/google/guides/provider_reference.html#credentials
   region  = var.gcp_region
   project = var.gcp_project
-}
-
-provider "aws" {
-  # aws_s3_bucket resources will be created in the region specified in this
-  # provider.
-  # https://github.com/hashicorp/terraform/issues/12512
-  region  = var.aws_region
-  profile = var.aws_profile
 }
 
 provider "kubernetes" {
@@ -168,8 +151,7 @@ locals {
     "${pair[0]}-${pair[1]}" => {
       kubernetes_namespace                    = kubernetes_namespace.namespaces[pair[0]].metadata[0].name
       packet_decryption_key_kubernetes_secret = kubernetes_secret.ingestion_packet_decryption_keys[pair[0]].metadata[0].name
-      ingestor_aws_role_arn                   = lookup(jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity, "aws-iam-entity", "")
-      ingestor_gcp_service_account_id         = lookup(jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity, "google-service-account", "")
+      ingestor_gcp_service_account_email      = jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity.google-service-account-email
     }
   }
 }
@@ -180,12 +162,18 @@ module "data_share_processors" {
   environment                             = var.environment
   data_share_processor_name               = each.key
   gcp_project                             = var.gcp_project
-  ingestor_aws_role_arn                   = each.value.ingestor_aws_role_arn
-  ingestor_google_service_account_id      = each.value.ingestor_gcp_service_account_id
-  peer_share_processor_aws_account_id     = jsondecode(data.http.peer_share_processor_global_manifest.body).server-identity.aws-account-id
+  gcp_region                              = var.gcp_region
+  ingestor_gcp_service_account_email      = each.value.ingestor_gcp_service_account_email
   kubernetes_namespace                    = each.value.kubernetes_namespace
   packet_decryption_key_kubernetes_secret = each.value.packet_decryption_key_kubernetes_secret
   certificate_domain                      = "${var.environment}.certificates.${var.manifest_domain}"
+
+  # TODO clarify how the NIH data share processors in AWS will access ISRG
+  # TODO buckets in GCP. This assumes that they have a GCP account and provide
+  # TODO us a service account email in their global manifest.
+  peer_share_processor_gcp_service_account_email = jsondecode(data.http.peer_share_processor_global_manifest.body).server-identity.google-service-account-email
+  peer_share_processor_aws_iam_role = jsondecode(data.http.peer_share_processor_global_manifest.body).server-identity.aws-iam-role-to-assume
+  peer_share_processor_aws_account_id = jsondecode(data.http.peer_share_processor_global_manifest.body).server-identity.aws-account-id
 
   depends_on = [module.gke]
 }
@@ -196,8 +184,15 @@ module "data_share_processors" {
 # operator discovers in our global manifest.
 resource "google_service_account" "sum_part_bucket_writer" {
   provider     = google-beta
-  account_id   = "prio-${var.environment}-sum-writer"
+  account_id   = "prio-${random_string.account_id.result}-sum-writer"
   display_name = "prio-${var.environment}-sum-part-bucket-writer"
+}
+
+resource "random_string" "account_id" {
+  length  = 12
+  upper   = false
+  number  = false
+  special = false
 }
 
 # Permit the service accounts for all the data share processors to impersonate
