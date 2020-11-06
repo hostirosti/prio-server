@@ -113,6 +113,27 @@ provider "kubernetes" {
   load_config_file       = false
 }
 
+# Opt into the various GCP APIs we will use. If we don't do this here, then
+# apply fails repeatedly and the operator has to click buttons in a web console
+# to achieve the same thing.
+resource "google_project_service" "compute_api" {
+  provider = google-beta
+  project = var.gcp_project
+  service = "compute.googleapis.com"
+}
+
+resource "google_project_service" "gke_api" {
+  provider = google-beta
+  project = var.gcp_project
+  service = "container.googleapis.com"
+}
+
+resource "google_project_service" "kms_api" {
+  provider = google-beta
+  project = var.gcp_project
+  service = "cloudkms.googleapis.com"
+}
+
 module "manifest" {
   source                                = "./modules/manifest"
   environment                           = var.environment
