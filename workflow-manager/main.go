@@ -331,19 +331,10 @@ func (b *bucket) listFilesS3(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("making AWS session: %w", err)
 	}
 
-	arnComponents := strings.Split(b.identity, ":")
-	if arnComponents[0] != "arn" {
-		return nil, fmt.Errorf("invalid AWS identity %q. Must start with \"arn:\"", b.identity)
-	}
-	if len(arnComponents) != 6 {
-		return nil, fmt.Errorf("invalid ARN: %q", b.identity)
-	}
-	audience := fmt.Sprintf("sts.amazonaws.com/%s", arnComponents[4])
-
 	stsSTS := sts.New(sess)
 	roleSessionName := ""
 	roleProvider := stscreds.NewWebIdentityRoleProviderWithToken(
-		stsSTS, b.identity, roleSessionName, tokenFetcher{audience})
+		stsSTS, b.identity, roleSessionName, tokenFetcher{"prio-bucket-access"})
 
 	credentials := credentials.NewCredentials(roleProvider)
 	log.Printf("listing files in s3://%s as %s", bucket, b.identity)

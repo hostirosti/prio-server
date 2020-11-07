@@ -20,7 +20,6 @@ use rusoto_s3::{
 use rusoto_sts::WebIdentityProvider;
 use std::{
     boxed::Box,
-    env,
     io::{Read, Write},
     mem,
     pin::Pin,
@@ -38,10 +37,6 @@ use tokio::{
 // the *Kubernetes* service account, not the GCP one.
 // See terraform/modules/gke/gke.tf and terraform/modules/kuberenetes/kubernetes.tf
 const METADATA_SERVICE_TOKEN_URL: &str = "http://metadata.google.internal:80/computeMetadata/v1/instance/service-accounts/default/identity";
-
-// When running in GCP, we are provided the AWS account ID that owns our buckets
-// via environment variable.
-const AWS_ACCOUNT_ID_ENVIRONMENT_VARIABLE: &str = "AWS_ACCOUNT_ID";
 
 /// Constructs a basic runtime suitable for use in our single threaded context
 fn basic_runtime() -> Result<Runtime> {
@@ -90,23 +85,13 @@ impl S3Transport {
                     // fetching tokens, allowing Rusoto to automatically get new
                     // credentials if they expire (which they do every hour).
                     let oidc_token_variable = Variable::dynamic(|| {
-                        let aws_account_id = env::var(AWS_ACCOUNT_ID_ENVIRONMENT_VARIABLE)
-                            .map_err(|e| {
-                                CredentialsError::new(format!(
-                                    "could not read {} from environment: {}",
-                                    AWS_ACCOUNT_ID_ENVIRONMENT_VARIABLE, e
-                                ))
-                            })?;
                         // We use ureq for this request because it is designed
                         // to use purely synchronous Rust. Ironically, we are in
                         // the context of an async runtime when this callback is
                         // invoked, but because the closure is not declared
                         // async, we cannot use .await to work with Futures.
                         let response = ureq::get(METADATA_SERVICE_TOKEN_URL)
-                            .query(
-                                "audience",
-                                format!("sts.amazonaws.com/{}", aws_account_id).as_ref(),
-                            )
+                            .query("audience", format!("prio-bucket-access").as_ref())
                             .set("Metadata-Flavor", "Google")
                             // By default, ureq will wait forever to connect or
                             // read.
