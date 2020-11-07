@@ -10,6 +10,11 @@ variable "gcp_project" {
   type = string
 }
 
+variable "use_aws" {
+  type        = bool
+  description = "Whether this env should create any of its storage in AWS"
+}
+
 variable "aws_region" {
   type = string
 }
@@ -42,7 +47,7 @@ variable "managed_dns_zone" {
   type = map(string)
 }
 
-variable "peer_share_processor_manifest_base_url" {
+variable "remote_dsp_manifest_base_url" {
   type = string
 }
 
@@ -56,8 +61,10 @@ variable "test_peer_environment" {
   description = <<DESCRIPTION
 Describes a pair of data share processor environments set up to test against
 each other. One environment, named in "env_with_ingestor", hosts a fake
-ingestion server. The other, named in "env_without_ingestor", does not. This
-variable should not be specified in production deployments.
+ingestion server. The other, named in "env_without_ingestor", does not. That env
+will have its ingestion and peer validation buckets in S3, and the region the
+buckets are is is indicated by the "aws_region" key. This variable should not be
+specified in production deployments.
 DESCRIPTION
 }
 
@@ -118,28 +125,32 @@ provider "kubernetes" {
 # to achieve the same thing.
 resource "google_project_service" "compute_api" {
   provider = google-beta
-  project = var.gcp_project
-  service = "compute.googleapis.com"
+  project  = var.gcp_project
+  service  = "compute.googleapis.com"
 }
 
 resource "google_project_service" "gke_api" {
   provider = google-beta
-  project = var.gcp_project
-  service = "container.googleapis.com"
+  project  = var.gcp_project
+  service  = "container.googleapis.com"
 }
 
 resource "google_project_service" "kms_api" {
   provider = google-beta
-  project = var.gcp_project
-  service = "cloudkms.googleapis.com"
+  project  = var.gcp_project
+  service  = "cloudkms.googleapis.com"
 }
 
 module "manifest" {
-  source                                = "./modules/manifest"
-  environment                           = var.environment
-  gcp_region                            = var.gcp_region
-  managed_dns_zone                      = var.managed_dns_zone
-  sum_part_bucket_service_account_email = google_service_account.sum_part_bucket_writer.email
+  source                                         = "./modules/manifest"
+  environment                                    = var.environment
+  gcp_region                                     = var.gcp_region
+  managed_dns_zone                               = var.managed_dns_zone
+  role_arn_assumed_by_remote_dsp                 = local.role_assumed_by_remote_dsp.arn
+  remote_bucket_writer_gcp_service_account_id    = google_service_account.remote_bucket_writer.unique_id
+  remote_bucket_writer_gcp_service_account_email = google_service_account.remote_bucket_writer.email
+
+  depends_on = [google_project_service.compute_api]
 }
 
 module "gke" {
@@ -149,6 +160,12 @@ module "gke" {
   gcp_region      = var.gcp_region
   gcp_project     = var.gcp_project
   machine_type    = var.machine_type
+
+  depends_on = [
+    google_project_service.compute_api,
+    google_project_service.gke_api,
+    google_project_service.kms_api,
+  ]
 }
 
 # For each peer data share processor, we will receive ingestion batches from two
@@ -161,9 +178,9 @@ data "http" "ingestor_global_manifests" {
   url      = "https://${each.value}/global-manifest.json"
 }
 
-# Then we fetch the single global manifest for all the peer share processors.
-data "http" "peer_share_processor_global_manifest" {
-  url = "https://${var.peer_share_processor_manifest_base_url}/global-manifest.json"
+# Then we fetch the single global manifest for all the remote share processors.
+data "http" "remote_dsp_global_manifest" {
+  url = "https://${var.remote_dsp_manifest_base_url}/global-manifest.json"
 }
 
 # While we create a distinct data share processor for each (ingestor, locality)
@@ -202,6 +219,8 @@ resource "kubernetes_secret" "ingestion_packet_decryption_keys" {
   }
 }
 
+data "aws_caller_identity" "current" {}
+
 # Now, we take the set product of localities x ingestor names to
 # get the config values for all the data share processors we need to create.
 locals {
@@ -211,11 +230,28 @@ locals {
       ingestor                                = pair[1]
       kubernetes_namespace                    = kubernetes_namespace.namespaces[pair[0]].metadata[0].name
       packet_decryption_key_kubernetes_secret = kubernetes_secret.ingestion_packet_decryption_keys[pair[0]].metadata[0].name
-      ingestor_aws_role_arn                   = lookup(jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity, "aws-iam-entity", "")
-      ingestor_gcp_service_account_id         = lookup(jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity, "google-service-account", "")
+      ingestor_gcp_service_account_id         = jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity.gcp-service-account-id
+      ingestor_gcp_service_account_email      = jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity.gcp-service-account-email
       ingestor_manifest_base_url              = var.ingestors[pair[1]]
     }
   }
+  remote_dsp_identity = jsondecode(data.http.remote_dsp_global_manifest.body).server-identity
+  # resource aws_iam_role.peer_dsp_assumed_role can't be created until the peer
+  # data share processor's global manifest is available, because it needs the
+  # peer GCP service account ID. We define the role name and ARN here as a local
+  # so that we can use it during apply-bootstrap without actually creating the
+  # policy, breaking the dependency cycle.
+  role_assumed_by_remote_dsp_name = "prio-${var.environment}-peer-validation-bucket-writer"
+  role_assumed_by_remote_dsp = var.use_aws ? {
+    name = local.role_assumed_by_remote_dsp_name
+    arn  = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${local.role_assumed_by_remote_dsp_name}"
+    } : {
+    name = ""
+    arn  = ""
+  }
+  # This is the identity (AWS IAM role or GCP SA email) that this DSP should
+  # assume in order to write content to the peer's buckets.
+  identity_for_writing_to_remote_storage = lookup(local.remote_dsp_identity, "validation-writer-aws-role-arn", google_service_account.remote_bucket_writer.email)
 }
 
 module "data_share_processors" {
@@ -224,17 +260,22 @@ module "data_share_processors" {
   environment                             = var.environment
   data_share_processor_name               = each.key
   ingestor                                = each.value.ingestor
+  use_aws                                 = var.use_aws
+  aws_region                              = var.aws_region
   gcp_region                              = var.gcp_region
   gcp_project                             = var.gcp_project
   kubernetes_namespace                    = each.value.kubernetes_namespace
   certificate_domain                      = "${var.environment}.certificates.${var.manifest_domain}"
-  ingestor_aws_role_arn                   = each.value.ingestor_aws_role_arn
   ingestor_gcp_service_account_id         = each.value.ingestor_gcp_service_account_id
+  ingestor_gcp_service_account_email      = each.value.ingestor_gcp_service_account_email
   ingestor_manifest_base_url              = each.value.ingestor_manifest_base_url
   packet_decryption_key_kubernetes_secret = each.value.packet_decryption_key_kubernetes_secret
-  peer_share_processor_aws_account_id     = jsondecode(data.http.peer_share_processor_global_manifest.body).server-identity.aws-account-id
-  peer_share_processor_manifest_base_url  = var.peer_share_processor_manifest_base_url
-  sum_part_bucket_service_account_email   = google_service_account.sum_part_bucket_writer.email
+  remote_dsp_manifest_base_url            = var.remote_dsp_manifest_base_url
+  remote_dsp_gcp_service_account_id       = local.remote_dsp_identity.gcp-service-account-id
+  remote_dsp_gcp_service_account_email    = local.remote_dsp_identity.gcp-service-account-email
+  role_arn_assumed_by_remote_dsp          = local.role_assumed_by_remote_dsp.arn
+  identity_for_writing_to_remote_storage  = local.identity_for_writing_to_remote_storage
+  sum_part_bucket_service_account_email   = google_service_account.remote_bucket_writer.email
   portal_server_manifest_base_url         = var.portal_server_manifest_base_url
   own_manifest_base_url                   = module.manifest.base_url
   test_peer_environment                   = var.test_peer_environment
@@ -243,23 +284,55 @@ module "data_share_processors" {
   depends_on = [module.gke]
 }
 
-# The portal owns two sum part buckets (one for each data share processor) and
-# the one for this data share processor gets configured by the portal operator
-# to permit writes from this GCP service account, whose email the portal
-# operator discovers in our global manifest.
-resource "google_service_account" "sum_part_bucket_writer" {
+# The AWS IAM role assumed by the peer data share processor to write validation
+# shares to this DSP's validation buckets, if this env has buckets in S3. The
+# role is configured to allow assumption by the GCP service account ID
+resource "aws_iam_role" "role_assumed_by_remote_dsp" {
+  count              = local.role_assumed_by_remote_dsp.name == "" ? 0 : 1
+  name               = local.role_assumed_by_remote_dsp.name
+  assume_role_policy = <<ROLE
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "accounts.google.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "accounts.google.com:sub": "${local.remote_dsp_identity.gcp-service-account-id}"
+        }
+      }
+    }
+  ]
+}
+ROLE
+
+  tags = {
+    environment = "prio-${var.environment}"
+  }
+}
+
+# This GCP service account is used for all writes to peer owned cloud storage,
+# that is, the portal server's sum part bucket as well as all of the peer data
+# share processor's validation share buckets. Its email is advertised in the
+# global manifest, so that peers may discover it and grant it access to their
+# cloud storage buckets.
+resource "google_service_account" "remote_bucket_writer" {
   provider     = google-beta
-  account_id   = "prio-${var.environment}-sum-writer"
-  display_name = "prio-${var.environment}-sum-part-bucket-writer"
+  account_id   = "prio-${var.environment}-remote-writer"
+  display_name = "prio-${var.environment}-remote-bucket-writer"
 }
 
 # Permit the service accounts for all the data share processors to request Oauth
-# tokens allowing them to impersonate the sum part bucket writer.
-resource "google_service_account_iam_binding" "data_share_processors_to_sum_part_bucket_writer_token_creator" {
+# tokens allowing them to impersonate the peer bucket writer.
+resource "google_service_account_iam_binding" "data_share_processors_to_peer_bucket_writer_token_creator" {
   provider           = google-beta
-  service_account_id = google_service_account.sum_part_bucket_writer.name
+  service_account_id = google_service_account.remote_bucket_writer.name
   role               = "roles/iam.serviceAccountTokenCreator"
-  members            = [for v in module.data_share_processors : v.service_account_email]
+  members            = [for v in module.data_share_processors : "serviceAccount:${v.service_account_email}"]
 }
 
 module "fake_server_resources" {
@@ -268,7 +341,7 @@ module "fake_server_resources" {
   manifest_bucket              = module.manifest.bucket
   gcp_region                   = var.gcp_region
   environment                  = var.environment
-  sum_part_bucket_writer_email = google_service_account.sum_part_bucket_writer.email
+  sum_part_bucket_writer_email = google_service_account.remote_bucket_writer.email
   ingestors                    = var.ingestors
 }
 

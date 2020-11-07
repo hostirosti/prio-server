@@ -10,11 +10,22 @@ variable "managed_dns_zone" {
   type = map(string)
 }
 
-variable "sum_part_bucket_service_account_email" {
+variable "role_arn_assumed_by_remote_dsp" {
+  type        = string
+  description = <<DESCRIPTION
+The ARN of the AWS IAM role that peers should assume in order to write to the
+storage buckets owned by this data share processor. If absent, peers should not
+assume any role.
+DESCRIPTION
+}
+
+variable "remote_bucket_writer_gcp_service_account_id" {
   type = string
 }
 
-data "aws_caller_identity" "current" {}
+variable "remote_bucket_writer_gcp_service_account_email" {
+  type = string
+}
 
 # Make a bucket where we will store global and specific manifests and from which
 # peers can fetch them.
@@ -48,6 +59,20 @@ resource "google_storage_bucket_iam_binding" "public_read" {
   ]
 }
 
+locals {
+  base_server_identity = {
+    gcp-service-account-id    = tonumber(var.remote_bucket_writer_gcp_service_account_id)
+    gcp-service-account-email = var.remote_bucket_writer_gcp_service_account_email
+  }
+  server_identity = var.role_arn_assumed_by_remote_dsp == "" ? (
+    local.base_server_identity
+    ) : (
+    merge(local.base_server_identity, {
+      validation-writer-aws-role-arn = var.role_arn_assumed_by_remote_dsp
+    })
+  )
+}
+
 # Puts this data share processor's global manifest into the bucket.
 resource "google_storage_bucket_object" "global_manifest" {
   provider      = google-beta
@@ -56,11 +81,8 @@ resource "google_storage_bucket_object" "global_manifest" {
   content_type  = "application/json"
   cache_control = "no-cache"
   content = jsonencode({
-    format = 0
-    server-identity = {
-      aws-account-id            = tonumber(data.aws_caller_identity.current.account_id)
-      gcp-service-account-email = var.sum_part_bucket_service_account_email
-    }
+    format          = 1
+    server-identity = local.server_identity
   })
 }
 
