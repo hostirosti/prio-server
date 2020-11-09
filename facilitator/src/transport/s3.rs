@@ -38,6 +38,11 @@ use tokio::{
 // See terraform/modules/gke/gke.tf and terraform/modules/kuberenetes/kubernetes.tf
 const METADATA_SERVICE_TOKEN_URL: &str = "http://metadata.google.internal:80/computeMetadata/v1/instance/service-accounts/default/identity";
 
+pub struct S3TransportIdentity {
+    gcp_service_account: String,
+    aws_iam_role: String,
+}
+
 /// Constructs a basic runtime suitable for use in our single threaded context
 fn basic_runtime() -> Result<Runtime> {
     Ok(Builder::new().basic_scheduler().enable_all().build()?)
@@ -46,17 +51,17 @@ fn basic_runtime() -> Result<Runtime> {
 /// Implementation of Transport that reads and writes objects from Amazon S3.
 pub struct S3Transport {
     path: S3Path,
-    iam_role: Option<String>,
+    identity: Option<S3TransportIdentity>,
     // client_provider allows injection of mock S3Client for testing purposes
     client_provider: ClientProvider,
 }
 
 impl S3Transport {
-    pub fn new(path: S3Path, identity: Identity) -> S3Transport {
+    pub fn new(path: S3Path, identity: Option<S3TransportIdentity>) -> S3Transport {
         S3Transport::new_with_client(
             path,
             identity,
-            Box::new(|region: &Region, iam_role: Option<String>| {
+            Box::new(|region: &Region, identity: Option<S3TransportIdentity>| {
                 // Rusoto uses Hyper which uses connection pools. The default
                 // timeout for those connections is 90 seconds[1]. Amazon S3's
                 // API closes idle client connections after 20 seconds[2]. If we
@@ -76,7 +81,7 @@ impl S3Transport {
                 let connector = HttpsConnector::new();
                 let http_client = rusoto_core::HttpClient::from_builder(builder, connector);
 
-                if let Some(iam_role) = iam_role {
+                if let Some(identity) = identity {
                     // When running in GKE, the token used to authenticate to
                     // AWS S3 is made available via the instance metadata
                     // service. See terraform/modules/kubernetes/kubernetes.tf
@@ -91,7 +96,7 @@ impl S3Transport {
                         // invoked, but because the closure is not declared
                         // async, we cannot use .await to work with Futures.
                         let response = ureq::get(METADATA_SERVICE_TOKEN_URL)
-                            .query("audience", format!("prio-bucket-access").as_ref())
+                            .query("audience", "prio-bucket-access")
                             .set("Metadata-Flavor", "Google")
                             // By default, ureq will wait forever to connect or
                             // read.
@@ -152,12 +157,12 @@ impl S3Transport {
 
     fn new_with_client(
         path: S3Path,
-        identity: Identity,
+        identity: Option<S3TransportIdentity>,
         client_provider: ClientProvider,
     ) -> S3Transport {
         S3Transport {
             path: path.ensure_directory_prefix(),
-            iam_role: identity.map(|x| x.to_string()),
+            identity: identity,
             client_provider,
         }
     }

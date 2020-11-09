@@ -78,12 +78,16 @@ const SHARED_HELP: &str = "Storage arguments: Any flag ending in -input or -outp
      or a local directory name. The corresponding -identity flag specifies \
      what identity to use with a bucket.
      
-     For S3 buckets: An identity flag may contain an AWS IAM role, specified \
-     using an ARN (i.e. \"arn:...\"). Facilitator will assume that role \
-     using an OIDC auth token obtained from the GKE metadata service. \
+     For S3 buckets: An identity flag may contain a GCP service account and an \
+     AWS IAM role, specified as an email address, followed by a '/', followed \
+     by an ARN (i.e. \"name@server.com/arn:...\"). Facilitator will \
+     impersonate that GCP service account using an Oauth token obtained from \
+     the GKE metadata service, and then assume that role using an OIDC auth \
+     token obtained from the GCP IAM service.
      Appropriate mappings need to be in place from Facilitator's k8s \
-     service account to its GCP service account to the IAM role. If \
-     the identity flag is empty, use credentials from ~/.aws.
+     service account to its GCP service account to the named GCP service \
+     account to the IAM role. If the identity flag is empty, use credentials \
+     from ~/.aws.
 
      For GS buckets: An identity flag may contain a GCP service account \
      (identified by an email address). Requests to Google Storage (gs://) \
