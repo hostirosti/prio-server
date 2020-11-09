@@ -16,6 +16,87 @@ const STORAGE_API_BASE_URL: &str = "https://storage.googleapis.com";
 const DEFAULT_OAUTH_TOKEN_URL: &str =
     "http://metadata.google.internal:80/computeMetadata/v1/instance/service-accounts/default/token";
 
+/// OIDCTokenProvider uses GCP IAM API to obtain OIDC web identity tokens that
+/// can be used to obtain an auth token allowing assumption of a specified AWS
+/// role.
+#[derive(Debug)]
+struct OIDCTokenProvider {
+    /// Provides the Oauth tokens for the default GCP service account to
+    /// authenticate subsequent GCP IAM API calls to obtain an OIDC token.
+    oauth_provider: OauthTokenProvider,
+    /// The email of the GCP service account that is permitted to assume the
+    /// role, and that the default service account is permitted to get tokens
+    /// for
+    gcp_sa_email: String,
+    /// The ARN of the AWS IAM role to eventually assume.
+    aws_role_arn: String,
+    /// The audience to request in the OIDC token.
+    token_audience: String,
+}
+
+impl OIDCTokenProvider {
+    /// Create a new OIDCTokenProvider which will impersonate the specified GCP
+    /// SA in order to then obtain OIDC web identity tokens allowing assumption
+    /// of the specified AWS role, scoped to the specified audience.
+    fn new(
+        gcp_sa_email: String,
+        aws_role_arn: String,
+        token_audience: String,
+    ) -> OIDCTokenProvider {
+        OIDCTokenProvider {
+            oauth_provider: OauthTokenProvider::new(
+                Some(gcp_sa_email),
+                "https://www.googleapis.com/auth/iam".to_owned(),
+            ),
+            aws_role_arn,
+            token_audience,
+        }
+    }
+
+    fn ensure_oidc_web_identity_token(&mut self) -> Result<String> {
+        // API reference:
+        // https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateIdToken
+        let request_url = format!("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:generateIdToken",
+            service_account_to_impersonate);
+        let auth = format!(
+            "Bearer {}",
+            self.ensure_default_service_account_oauth_token()?
+        );
+        let http_response = ureq::post(&request_url)
+            .set("Authorization", &auth)
+            .set("Content-Type", "application/json")
+            // At the moment, these tokens are only used to read and write from
+            // GCS buckets, so we request an appropriate scope. We could further
+            // narrow this to a devstorage.read token if we knew what it was
+            // going to be used for, but that would require this object to
+            // manage two impersonation tokens which is more work than I want to
+            // do right now.
+            // https://cloud.google.com/storage/docs/authentication#oauth-scopes
+            .send_json(ureq::json!({
+                "scope": [
+                    self.impersonated_service_account_oauth_scope
+                ]
+            }));
+        if http_response.error() {
+            return Err(anyhow!(
+                "failed to get Oauth token to impersonate service account {}: {:?}",
+                service_account_to_impersonate,
+                http_response
+            ));
+        }
+
+        let response = http_response
+            .into_json_deserialize::<GenerateAccessTokenResponse>()
+            .context("failed to deserialize response from IAM API")?;
+        self.impersonated_service_account_oauth_token = Some(OauthToken {
+            token: response.access_token.clone(),
+            expiration: response.expire_time,
+        });
+
+        Ok(response.access_token)
+    }
+}
+
 /// A wrapper around an Oauth token and its expiration date.
 #[derive(Debug)]
 struct OauthToken {
@@ -50,18 +131,17 @@ struct GenerateAccessTokenResponse {
     expire_time: DateTime<Utc>,
 }
 
-/// OauthTokenProvider manages a default service account Oauth token (i.e. the
-/// one for a GCP service account mapped to a Kubernetes service account) and an
-/// Oauth token used to impersonate another service account.
+trait OauthTokenProvider {
+    /// Returns the Oauth token to use with GCS storage API in an Authorization
+    /// header, fetching it or renewing it if necessary.
+    fn ensure_storage_access_oauth_token(&mut self) -> Result<String>;
+}
+
 #[derive(Debug)]
-struct OauthTokenProvider {
-    /// Holds the service account email to impersonate, if one was provided to
-    /// OauthTokenProvider::new.
-    service_account_to_impersonate: Option<String>,
-    /// This field is None after instantiation and is Some after the first
-    /// successful request for a token for the default service account, though
-    /// the contained token may be expired.
-    default_service_account_oauth_token: Option<OauthToken>,
+struct ImpersonatedAccountOauthTokenProvider {
+    default_account_oauth_provider: DefaultAccountOauthTokenProvider,
+    /// Holds the service account email to impersonate.
+    service_account_to_impersonate: String,
     /// This field is None after instantiation and is Some after the first
     /// successful request for a token for the impersonated service account,
     /// though the contained token may be expired. This will always be None if
@@ -69,27 +149,103 @@ struct OauthTokenProvider {
     impersonated_service_account_oauth_token: Option<OauthToken>,
 }
 
-impl OauthTokenProvider {
+impl OauthTokenProvider for ImpersonatedAccountOauthTokenProvider {
+    fn ensure_storage_access_oauth_token(&mut self) -> Result<String> {
+        self.ensure_impersonated_service_account_oauth_token()
+    }
+}
+
+impl ImpersonatedAccountOauthTokenProvider {
     /// Creates a token provider which can impersonate the specified service
     /// account.
-    fn new(service_account_to_impersonate: Option<String>) -> OauthTokenProvider {
-        OauthTokenProvider {
+    fn new(service_account_to_impersonate: String) -> ImpersonatedAccountOauthTokenProvider {
+        ImpersonatedAccountOauthTokenProvider {
+            default_account_oauth_provider: DefaultAccountOauthTokenProvider::new(),
             service_account_to_impersonate,
-            default_service_account_oauth_token: None,
             impersonated_service_account_oauth_token: None,
         }
     }
 
-    /// Returns the Oauth token to use with GCS storage API in an Authorization
-    /// header, fetching it or renewing it if necessary. If a service account to
-    /// impersonate was provided, the default service account is used to
-    /// authenticate to the GCP IAM API to retrieve an Oauth token. If no
-    /// impersonation is taking place, provides the default service account
-    /// Oauth token.
+    /// Returns the current OAuth token for the impersonated service account, if
+    /// it is valid. Otherwise obtains and returns a new one.
+    fn ensure_impersonated_service_account_oauth_token(&mut self) -> Result<String> {
+        if self.service_account_to_impersonate.is_none() {
+            return Err(anyhow!("no service account to impersonate was provided"));
+        }
+
+        if let Some(token) = &self.impersonated_service_account_oauth_token {
+            if !token.expired() {
+                return Ok(token.token.clone());
+            }
+        }
+
+        let service_account_to_impersonate = self.service_account_to_impersonate.clone().unwrap();
+        // API reference:
+        // https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken
+        let request_url = format!("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:generateAccessToken",
+            service_account_to_impersonate);
+        let auth = format!(
+            "Bearer {}",
+            self.ensure_default_service_account_oauth_token()?
+        );
+        let http_response = ureq::post(&request_url)
+            .set("Authorization", &auth)
+            .set("Content-Type", "application/json")
+            // At the moment, these tokens are only used to read and write from
+            // GCS buckets, so we request an appropriate scope. We could further
+            // narrow this to a devstorage.read token if we knew what it was
+            // going to be used for, but that would require this object to
+            // manage two impersonation tokens which is more work than I want to
+            // do right now.
+            // https://cloud.google.com/storage/docs/authentication#oauth-scopes
+            .send_json(ureq::json!({
+                "scope": [
+                    self.impersonated_service_account_oauth_scope
+                ]
+            }));
+        if http_response.error() {
+            return Err(anyhow!(
+                "failed to get Oauth token to impersonate service account {}: {:?}",
+                service_account_to_impersonate,
+                http_response
+            ));
+        }
+
+        let response = http_response
+            .into_json_deserialize::<GenerateAccessTokenResponse>()
+            .context("failed to deserialize response from IAM API")?;
+        self.impersonated_service_account_oauth_token = Some(OauthToken {
+            token: response.access_token.clone(),
+            expiration: response.expire_time,
+        });
+
+        Ok(response.access_token)
+    }
+}
+
+/// DefaultAccountOauthTokenProvider manages the  default service account Oauth
+/// token, i.e. the one for a GCP service account mapped to a Kubernetes service
+/// account.
+#[derive(Debug)]
+struct DefaultAccountOauthTokenProvider {
+    /// This field is None after instantiation and is Some after the first
+    /// successful request for a token for the default service account, though
+    /// the contained token may be expired.
+    default_service_account_oauth_token: Option<OauthToken>,
+}
+
+impl OauthTokenProvider for DefaultAccountOauthTokenProvider {
     fn ensure_storage_access_oauth_token(&mut self) -> Result<String> {
-        match self.service_account_to_impersonate {
-            Some(_) => self.ensure_impersonated_service_account_oauth_token(),
-            None => self.ensure_default_service_account_oauth_token(),
+        self.ensure_default_service_account_oauth_token()
+    }
+}
+
+impl DefaultAccountOauthTokenProvider {
+    /// Creates a token provider which fetches Oauth tokens from the GKE
+    /// metadata service.
+    fn new() -> DefaultAccountOauthTokenProvider {
+        DefaultAccountOauthTokenProvider {
+            default_service_account_oauth_token: None,
         }
     }
 
@@ -132,62 +288,6 @@ impl OauthTokenProvider {
 
         Ok(response.access_token)
     }
-
-    /// Returns the current OAuth token for the impersonated service account, if
-    /// it is valid. Otherwise obtains and returns a new one.
-    fn ensure_impersonated_service_account_oauth_token(&mut self) -> Result<String> {
-        if self.service_account_to_impersonate.is_none() {
-            return Err(anyhow!("no service account to impersonate was provided"));
-        }
-
-        if let Some(token) = &self.impersonated_service_account_oauth_token {
-            if !token.expired() {
-                return Ok(token.token.clone());
-            }
-        }
-
-        let service_account_to_impersonate = self.service_account_to_impersonate.clone().unwrap();
-        // API reference:
-        // https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken
-        let request_url = format!("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:generateAccessToken",
-            service_account_to_impersonate);
-        let auth = format!(
-            "Bearer {}",
-            self.ensure_default_service_account_oauth_token()?
-        );
-        let http_response = ureq::post(&request_url)
-            .set("Authorization", &auth)
-            .set("Content-Type", "application/json")
-            // At the moment, these tokens are only used to read and write from
-            // GCS buckets, so we request an appropriate scope. We could further
-            // narrow this to a devstorage.read token if we knew what it was
-            // going to be used for, but that would require this object to
-            // manage two impersonation tokens which is more work than I want to
-            // do right now.
-            // https://cloud.google.com/storage/docs/authentication#oauth-scopes
-            .send_json(ureq::json!({
-                "scope": [
-                    "https://www.googleapis.com/auth/devstorage.read_write"
-                ]
-            }));
-        if http_response.error() {
-            return Err(anyhow!(
-                "failed to get Oauth token to impersonate service account {}: {:?}",
-                service_account_to_impersonate,
-                http_response
-            ));
-        }
-
-        let response = http_response
-            .into_json_deserialize::<GenerateAccessTokenResponse>()
-            .context("failed to deserialize response from IAM API")?;
-        self.impersonated_service_account_oauth_token = Some(OauthToken {
-            token: response.access_token.clone(),
-            expiration: response.expire_time,
-        });
-
-        Ok(response.access_token)
-    }
 }
 
 /// GCSTransport manages reading and writing from GCS buckets, with
@@ -197,7 +297,7 @@ impl OauthTokenProvider {
 /// GCSTransport::new.
 pub struct GCSTransport {
     path: GCSPath,
-    oauth_token_provider: OauthTokenProvider,
+    oauth_token_provider: dyn OauthTokenProvider,
 }
 
 impl GCSTransport {
@@ -209,7 +309,10 @@ impl GCSTransport {
     pub fn new(path: GCSPath, identity: Identity) -> GCSTransport {
         GCSTransport {
             path: path.ensure_directory_prefix(),
-            oauth_token_provider: OauthTokenProvider::new(identity.map(|x| x.to_string())),
+            oauth_token_provider: match identity {
+                Some(identity) => ImpersonatedAccountOauthTokenProvider::new(identity.to_string()),
+                None => DefaultAccountOauthTokenProvider::new(),
+            },
         }
     }
 }
