@@ -10,6 +10,10 @@ variable "gcp_project" {
   type = string
 }
 
+variable "use_aws" {
+  type = bool
+}
+
 variable "aws_region" {
   type = string
 }
@@ -131,12 +135,35 @@ provider "kubernetes" {
   load_config_file       = false
 }
 
+# Opt into the various GCP APIs we will use. If we don't do this here, then
+# apply fails repeatedly and the operator has to click buttons in a web console
+# to achieve the same thing.
+resource "google_project_service" "compute_api" {
+  provider = google-beta
+  project  = var.gcp_project
+  service  = "compute.googleapis.com"
+}
+
+resource "google_project_service" "gke_api" {
+  provider = google-beta
+  project  = var.gcp_project
+  service  = "container.googleapis.com"
+}
+
+resource "google_project_service" "kms_api" {
+  provider = google-beta
+  project  = var.gcp_project
+  service  = "cloudkms.googleapis.com"
+}
+
 module "manifest" {
   source                                = "./modules/manifest"
   environment                           = var.environment
   gcp_region                            = var.gcp_region
   managed_dns_zone                      = var.managed_dns_zone
   sum_part_bucket_service_account_email = google_service_account.sum_part_bucket_writer.email
+
+  depends_on = [google_project_service.compute_api]
 }
 
 module "gke" {
@@ -146,6 +173,12 @@ module "gke" {
   gcp_region      = var.gcp_region
   gcp_project     = var.gcp_project
   machine_type    = var.machine_type
+
+  depends_on = [
+    google_project_service.compute_api,
+    google_project_service.gke_api,
+    google_project_service.kms_api,
+  ]
 }
 
 # For each peer data share processor, we will receive ingestion batches from two
@@ -208,38 +241,38 @@ locals {
       ingestor                                = pair[1]
       kubernetes_namespace                    = kubernetes_namespace.namespaces[pair[0]].metadata[0].name
       packet_decryption_key_kubernetes_secret = kubernetes_secret.ingestion_packet_decryption_keys[pair[0]].metadata[0].name
-      ingestor_aws_role_arn                   = lookup(jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity, "aws-iam-entity", "")
-      ingestor_gcp_service_account_id         = lookup(jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity, "google-service-account", "")
-      ingestor_gcp_service_account_email      = lookup(jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity, "gcp-service-account-email", "")
+      ingestor_gcp_service_account_email      = jsondecode(data.http.ingestor_global_manifests[pair[1]].body).server-identity.gcp-service-account-id
       ingestor_manifest_base_url              = var.ingestors[pair[1]]
     }
   }
+  peer_share_processor_server_identity = jsondecode(data.http.peer_share_processor_global_manifest.body).server-identity
 }
 
 module "data_share_processors" {
-  for_each                                = local.locality_ingestor_pairs
-  source                                  = "./modules/data_share_processor"
-  environment                             = var.environment
-  data_share_processor_name               = each.key
-  ingestor                                = each.value.ingestor
-  gcp_region                              = var.gcp_region
-  gcp_project                             = var.gcp_project
-  kubernetes_namespace                    = each.value.kubernetes_namespace
-  certificate_domain                      = "${var.environment}.certificates.${var.manifest_domain}"
-  ingestor_aws_role_arn                   = each.value.ingestor_aws_role_arn
-  ingestor_gcp_service_account_id         = each.value.ingestor_gcp_service_account_id
-  ingestor_gcp_service_account_email      = each.value.ingestor_gcp_service_account_email
-  ingestor_manifest_base_url              = each.value.ingestor_manifest_base_url
-  packet_decryption_key_kubernetes_secret = each.value.packet_decryption_key_kubernetes_secret
-  peer_share_processor_aws_account_id     = jsondecode(data.http.peer_share_processor_global_manifest.body).server-identity.aws-account-id
-  peer_share_processor_manifest_base_url  = var.peer_share_processor_manifest_base_url
-  sum_part_bucket_service_account_email   = google_service_account.sum_part_bucket_writer.email
-  portal_server_manifest_base_url         = var.portal_server_manifest_base_url
-  own_manifest_base_url                   = module.manifest.base_url
-  test_peer_environment                   = var.test_peer_environment
-  is_first                                = var.is_first
-  aggregation_period                      = var.aggregation_period
-  aggregation_grace_period                = var.aggregation_grace_period
+  for_each                                       = local.locality_ingestor_pairs
+  source                                         = "./modules/data_share_processor"
+  environment                                    = var.environment
+  data_share_processor_name                      = each.key
+  ingestor                                       = each.value.ingestor
+  use_aws                                        = var.use_aws
+  aws_region                                     = var.aws_region
+  gcp_region                                     = var.gcp_region
+  gcp_project                                    = var.gcp_project
+  kubernetes_namespace                           = each.value.kubernetes_namespace
+  certificate_domain                             = "${var.environment}.certificates.${var.manifest_domain}"
+  ingestor_gcp_service_account_email             = each.value.ingestor_gcp_service_account_email
+  ingestor_manifest_base_url                     = each.value.ingestor_manifest_base_url
+  packet_decryption_key_kubernetes_secret        = each.value.packet_decryption_key_kubernetes_secret
+  peer_share_processor_aws_account_id            = local.peer_share_processor_server_identity.aws-account-id
+  peer_share_processor_gcp_service_account_email = local.peer_share_processor_server_identity.gcp-service-account-email
+  peer_share_processor_manifest_base_url         = var.peer_share_processor_manifest_base_url
+  remote_bucket_writer_gcp_service_account_email = google_service_account.sum_part_bucket_writer.email
+  portal_server_manifest_base_url                = var.portal_server_manifest_base_url
+  own_manifest_base_url                          = module.manifest.base_url
+  test_peer_environment                          = var.test_peer_environment
+  is_first                                       = var.is_first
+  aggregation_period                             = var.aggregation_period
+  aggregation_grace_period                       = var.aggregation_grace_period
 
   depends_on = [module.gke]
 }
@@ -260,7 +293,7 @@ resource "google_service_account_iam_binding" "data_share_processors_to_sum_part
   provider           = google-beta
   service_account_id = google_service_account.sum_part_bucket_writer.name
   role               = "roles/iam.serviceAccountTokenCreator"
-  members            = [for v in module.data_share_processors : v.service_account_email]
+  members            = [for v in module.data_share_processors : "serviceAccount:${v.service_account_email}"]
 }
 
 module "fake_server_resources" {
