@@ -273,8 +273,8 @@ BgNVHSMECjAIgAYBAgMEBQYwCgYIKoZIzj0EAwIDRwAwRAIgLUZei8554YPf9hmy
 	}
 
 	keyUsage := x509.KeyUsageDigitalSignature
-	notBefore := time.Now()
-	notAfter := notBefore.Add(365 * 24 * time.Hour)
+	notBefore := time.Now().Add(-1 * 365 * 24 * time.Hour)
+	notAfter := notBefore.Add(2 * 365 * 24 * time.Hour)
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 
 	certificatesByNamespace := map[string]PacketEncryptionCertificate{}
@@ -352,7 +352,7 @@ BgNVHSMECjAIgAYBAgMEBQYwCgYIKoZIzj0EAwIDRwAwRAIgLUZei8554YPf9hmy
 			leafTemplate := x509.Certificate{
 				SerialNumber: leafSerialNumber,
 				Subject: pkix.Name{
-					Organization: []string{"Fake leaf cert"},
+					CommonName: manifestWrapper.CertificateFQDN,
 				},
 				DNSNames:              []string{manifestWrapper.CertificateFQDN},
 				NotBefore:             notBefore,
