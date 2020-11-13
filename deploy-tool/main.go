@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -12,11 +13,12 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math/big"
 	"os"
 	"os/exec"
 	"time"
 
-	"github.com/abetterinternet/prio-server/deploy-tool/cert"
+	_ "github.com/abetterinternet/prio-server/deploy-tool/cert"
 	"github.com/abetterinternet/prio-server/deploy-tool/config"
 )
 
@@ -197,7 +199,7 @@ func getConfigFilePath() string {
 }
 
 func main() {
-	deployConfig, err := config.Read(getConfigFilePath())
+	_, err := config.Read(getConfigFilePath())
 	if err != nil {
 		log.Fatalf("failed to parse config.toml: %v", err)
 	}
@@ -207,6 +209,73 @@ func main() {
 	if err := json.NewDecoder(os.Stdin).Decode(&terraformOutput); err != nil {
 		log.Fatalf("failed to parse specific manifests: %v", err)
 	}
+
+	// 	rootPrivateKeyPem := []byte(`
+	// -----BEGIN PRIVATE KEY-----
+	// MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmZV5+m8ZjEGvCkTZ
+	// VUDnyHwkusezfFboX9FQfRpfBWehRANCAARycgho4MWK/CZpg8026C4GYB9l6nt5
+	// WmELuQ7PPDXsJFvJ3jzIp41DeSdNKmOacQc2bf1aRQ9Qsl6flJsoXU9I
+	// -----END PRIVATE KEY-----
+	// `)
+
+	// 	rootCertificatePEM := []byte(`
+	// -----BEGIN CERTIFICATE-----
+	// MIIBaTCCAQ+gAwIBAgIRAIuO+TT/N6cRfhwCD2YR0okwCgYIKoZIzj0EAwIwGTEX
+	// MBUGA1UEChMORmFrZSByb290IGNlcnQwHhcNMjAxMTEzMTkwNDEwWhcNMjExMTEz
+	// MTkwNDEwWjAZMRcwFQYDVQQKEw5GYWtlIHJvb3QgY2VydDBZMBMGByqGSM49AgEG
+	// CCqGSM49AwEHA0IABHJyCGjgxYr8JmmDzTboLgZgH2Xqe3laYQu5Ds88NewkW8ne
+	// PMinjUN5J00qY5pxBzZt/VpFD1CyXp+UmyhdT0ijODA2MA4GA1UdDwEB/wQEAwIC
+	// hDATBgNVHSUEDDAKBggrBgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49
+	// BAMCA0gAMEUCIQD7PAElD0c3CQlAeOfhQ0SF0e9YhhDsn6ar09Cw08coyAIgYbnJ
+	// RHlgIqZIKmxy4PHDF1wJc/rwD02tuRUNjp3MsRY=
+	// -----END CERTIFICATE-----
+	// 	`)
+
+	intermediatePrivateKeyPEM := []byte(`
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUs7E5g537g/g27iw
+jFkrgEbvCpy3IlTVcu9Neprbec6hRANCAARvEY5RubQkTijCqikHJdKUUEactjc1
+zXONsskQrSKLeK/u8m3EFNPsa5eqwCHkx5hXZIakfsSk0+ZrfmBixkml
+-----END PRIVATE KEY-----
+`)
+
+	intermediatePrivateKeyBlock, _ := pem.Decode(intermediatePrivateKeyPEM)
+	if intermediatePrivateKeyBlock == nil || intermediatePrivateKeyBlock.Type != "PRIVATE KEY" {
+		log.Fatal("failed to parse PEM intermediate private key")
+	}
+
+	intermediatePrivateKey, err := x509.ParsePKCS8PrivateKey(intermediatePrivateKeyBlock.Bytes)
+	if err != nil {
+		log.Fatalf("failed to parse DER intermediate private key: %s", err)
+	}
+
+	intermediateCertificatePEM := []byte(`
+-----BEGIN CERTIFICATE-----
+MIIBcTCCARegAwIBAgIRANLZ4Nt6x7rXg++Qearmv5QwCgYIKoZIzj0EAwIwGTEX
+MBUGA1UEChMORmFrZSByb290IGNlcnQwHhcNMjAxMTEzMTkwNDEwWhcNMjExMTEz
+MTkwNDEwWjAhMR8wHQYDVQQKExZGYWtlIGludGVybWVkaWF0ZSBjZXJ0MFkwEwYH
+KoZIzj0CAQYIKoZIzj0DAQcDQgAEbxGOUbm0JE4owqopByXSlFBGnLY3Nc1zjbLJ
+EK0ii3iv7vJtxBTT7GuXqsAh5MeYV2SGpH7EpNPma35gYsZJpaM4MDYwDgYDVR0P
+AQH/BAQDAgKEMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA8GA1UdEwEB/wQFMAMBAf8w
+CgYIKoZIzj0EAwIDSAAwRQIgSGJRo0D/puGAmyJ5cssHeZWyggM36/LV7IYuSt34
+GNsCIQC+IBpn4swn8Kj5he4+H6y/sXHME2VmfY87ICAg9AAfKg==
+-----END CERTIFICATE-----
+`)
+
+	intermediateCertificateBlock, _ := pem.Decode(intermediateCertificatePEM)
+	if intermediateCertificateBlock == nil || intermediateCertificateBlock.Type != "CERTIFICATE" {
+		log.Fatal("failed to parse PEM intermediate certificate")
+	}
+
+	intermediateCertificate, err := x509.ParseCertificate(intermediateCertificateBlock.Bytes)
+	if err != nil {
+		log.Fatalf("failed to parse DER intermediate certificate: %s", err)
+	}
+
+	keyUsage := x509.KeyUsageDigitalSignature
+	notBefore := time.Now()
+	notAfter := notBefore.Add(365 * 24 * time.Hour)
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 
 	certificatesByNamespace := map[string]PacketEncryptionCertificate{}
 
@@ -275,10 +344,33 @@ func main() {
 				log.Fatalf("%s", err)
 			}
 
-			certificate, err := cert.IssueCertificate(deployConfig, manifestWrapper.CertificateFQDN, privKey)
+			leafSerialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
 			if err != nil {
-				log.Fatalf("%s", err)
+				log.Fatalf("failed to generate serial number for leaf: %v", err)
 			}
+
+			leafTemplate := x509.Certificate{
+				SerialNumber: leafSerialNumber,
+				Subject: pkix.Name{
+					Organization: []string{"Fake leaf cert"},
+				},
+				DNSNames:              []string{manifestWrapper.CertificateFQDN},
+				NotBefore:             notBefore,
+				NotAfter:              notAfter,
+				KeyUsage:              keyUsage,
+				IsCA:                  false,
+				ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+				BasicConstraintsValid: true,
+			}
+
+			leafCertDerBytes, err := x509.CreateCertificate(rand.Reader, &leafTemplate, intermediateCertificate, &privKey.PublicKey, intermediatePrivateKey)
+			if err != nil {
+				log.Fatalf("failed to create fake leaf certificate: %v", err)
+			}
+
+			leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertDerBytes})
+
+			certificate := fmt.Sprintf("%s%s", leafCertPEM, intermediateCertificatePEM)
 
 			packetEncryptionCertificate := PacketEncryptionCertificate{Certificate: certificate}
 
