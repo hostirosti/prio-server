@@ -139,6 +139,7 @@ fn end_to_end() {
         &mut pha_peer_validate_signable_transport,
         &mut pha_own_validate_signable_transport,
         true,
+        false,
     )
     .unwrap()
     .generate_validation_share()
@@ -152,6 +153,7 @@ fn end_to_end() {
         &mut pha_peer_validate_signable_transport,
         &mut pha_own_validate_signable_transport,
         true,
+        false,
     )
     .unwrap()
     .generate_validation_share()
@@ -165,6 +167,7 @@ fn end_to_end() {
         &mut facilitator_peer_validate_signable_transport,
         &mut facilitator_own_validate_signable_transport,
         false,
+        false,
     )
     .unwrap()
     .generate_validation_share()
@@ -177,6 +180,7 @@ fn end_to_end() {
         &mut facilitator_ingest_transport,
         &mut facilitator_peer_validate_signable_transport,
         &mut facilitator_own_validate_signable_transport,
+        false,
         false,
     )
     .unwrap()
@@ -218,6 +222,7 @@ fn end_to_end() {
         &start_date,
         &end_date,
         true,
+        false,
         &mut pha_ingest_transport,
         &mut pha_validate_verifiable_transport,
         &mut facilitator_validate_verifiable_transport,
@@ -239,6 +244,7 @@ fn end_to_end() {
         &start_date,
         &end_date,
         false,
+        false,
         &mut facilitator_ingest_transport,
         &mut facilitator_validate_verifiable_transport,
         &mut pha_validate_verifiable_transport,
@@ -258,6 +264,7 @@ fn end_to_end() {
                 true,
             ),
             &mut *pha_aggregation_transport.transport,
+            false,
         );
     let pha_sum_part = pha_aggregation_batch_reader.header(&pha_pub_keys).unwrap();
     assert_eq!(pha_sum_part.total_individual_clients, 30);
@@ -282,6 +289,7 @@ fn end_to_end() {
             false,
         ),
         &mut *facilitator_aggregation_transport.transport,
+        false,
     );
     let facilitator_sum_part = facilitator_aggregation_batch_reader
         .header(&facilitator_pub_keys)

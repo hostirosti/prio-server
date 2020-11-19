@@ -73,6 +73,8 @@ trait AppArgumentAdder {
     fn add_packet_decryption_key_argument(self: Self) -> Self;
 
     fn add_gcp_service_account_key_file_argument(self: Self) -> Self;
+
+    fn add_permissive_mode_argument(self: Self) -> Self;
 }
 
 const SHARED_HELP: &str = "Storage arguments: Any flag ending in -input or -output can take an \
@@ -319,6 +321,22 @@ impl<'a, 'b> AppArgumentAdder for App<'a, 'b> {
                 ),
         )
     }
+
+    fn add_permissive_mode_argument(self: App<'a, 'b>) -> App<'a, 'b> {
+        self.arg(
+            Arg::with_name("permissive")
+                .long("permissive")
+                .env("PERMISSIVE")
+                .help("Run in permissive mode")
+                .takes_value(false)
+                .long_help(
+                    "Run in permissive mode. In permissive mode, facilitator \
+                    does not to abort batch intake or aggregation if an \
+                    invalid signature or packet file measurement is \
+                    encountered and instead logs the problem and moves on.",
+                ),
+        )
+    }
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -491,7 +509,8 @@ fn main() -> Result<(), anyhow::Error> {
                 .add_storage_arguments(Entity::Ingestor, InOut::Input)
                 .add_manifest_base_url_argument(Entity::Peer)
                 .add_storage_arguments(Entity::Peer, InOut::Output)
-                .add_storage_arguments(Entity::Own, InOut::Output),
+                .add_storage_arguments(Entity::Own, InOut::Output)
+                .add_permissive_mode_argument()
         )
         .subcommand(
             SubCommand::with_name("aggregate")
@@ -565,6 +584,7 @@ fn main() -> Result<(), anyhow::Error> {
                 .add_storage_arguments(Entity::Portal, InOut::Output)
                 .add_packet_decryption_key_argument()
                 .add_batch_signing_key_arguments()
+                .add_permissive_mode_argument()
         )
         .subcommand(
             SubCommand::with_name("lint-manifest")
@@ -724,6 +744,7 @@ fn intake_batch(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         &mut peer_validation_transport,
         &mut own_validation_transport,
         is_first_from_arg(sub_matches),
+        sub_matches.is_present("permissive"),
     )?;
     batch_intaker.generate_validation_share()
 }
@@ -849,6 +870,7 @@ fn aggregate(sub_matches: &ArgMatches) -> Result<(), anyhow::Error> {
         )
         .unwrap(),
         is_first,
+        sub_matches.is_present("permissive"),
         &mut intake_transport,
         &mut VerifiableTransport {
             transport: own_validation_transport,

@@ -35,11 +35,13 @@ impl<'a> BatchIntaker<'a> {
         own_validation_transport: &'a mut SignableTransport,
         peer_validation_transport: &'a mut SignableTransport,
         is_first: bool,
+        permissive: bool,
     ) -> Result<BatchIntaker<'a>> {
         Ok(BatchIntaker {
             intake_batch: BatchReader::new(
                 Batch::new_ingestion(aggregation_name, batch_id, date),
                 &mut *ingestion_transport.transport.transport,
+                permissive,
             ),
             intake_public_keys: &ingestion_transport.transport.batch_signing_public_keys,
             packet_decryption_keys: &ingestion_transport.packet_decryption_keys,
@@ -90,6 +92,8 @@ impl<'a> BatchIntaker<'a> {
         let mut ingestion_packet_reader =
             self.intake_batch.packet_file_reader(&ingestion_header)?;
 
+        let mut packet_count = 0;
+
         let packet_file_digest = self.peer_validation_batch.multi_packet_file_writer(
             vec![&mut self.own_validation_batch],
             |mut packet_writer| loop {
@@ -128,10 +132,17 @@ impl<'a> BatchIntaker<'a> {
                     break;
                 }
                 if !did_create_validation_packet {
-                    return Err(anyhow!("failed to construct validation message"));
+                    return Err(anyhow!("failed to construct validation message for packet {} (likely packet decryption failure)", packet.uuid));
                 }
+                packet_count = packet_count + 1;
             },
         )?;
+
+        log::info!(
+            "successfully processed {} packets in ingestion batch {}",
+            packet_count,
+            ingestion_header.batch_uuid,
+        );
 
         // Construct validation header and write it out
         let header = ValidationHeader {
@@ -266,6 +277,7 @@ mod tests {
             &mut pha_peer_validate_transport,
             &mut pha_own_validate_transport,
             true,
+            false,
         )
         .unwrap();
 
@@ -280,6 +292,7 @@ mod tests {
             &mut facilitator_ingest_transport,
             &mut facilitator_peer_validate_transport,
             &mut facilitator_own_validate_transport,
+            false,
             false,
         )
         .unwrap();

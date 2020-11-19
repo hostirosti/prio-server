@@ -110,6 +110,7 @@ pub struct BatchReader<'a, H, P> {
     batch: Batch,
     transport: &'a mut dyn Transport,
     packet_schema: Schema,
+    permissive: bool,
 
     // These next two fields are not real and are used because not using H and P
     // in the struct definition is an error.
@@ -118,11 +119,12 @@ pub struct BatchReader<'a, H, P> {
 }
 
 impl<'a, H: Header, P: Packet> BatchReader<'a, H, P> {
-    pub fn new(batch: Batch, transport: &'a mut dyn Transport) -> Self {
+    pub fn new(batch: Batch, transport: &'a mut dyn Transport, permissive: bool) -> Self {
         BatchReader {
             batch,
             transport,
             packet_schema: P::schema(),
+            permissive,
             phantom_header: PhantomData,
             phantom_packet: PhantomData,
         }
@@ -149,17 +151,25 @@ impl<'a, H: Header, P: Packet> BatchReader<'a, H, P> {
             .read_to_end(&mut header_buf)
             .context("failed to read header from transport")?;
 
-        public_keys
+        let sig_valid = public_keys
             .get(&signature.key_identifier)
             .context(format!(
-                "key identifier {} not present in key map",
+                "key identifier {} not present in key map {:?}",
                 signature.key_identifier,
+                public_keys.keys(),
             ))?
-            .verify(&header_buf, &signature.batch_header_signature)
-            .context(format!(
-                "invalid signature on header with key {}",
-                signature.key_identifier,
-            ))?;
+            .verify(&header_buf, &signature.batch_header_signature);
+        if let Err(e) = sig_valid {
+            let message = format!(
+                "invalid signature on header with key {}: {:?}",
+                signature.key_identifier, e
+            );
+            if self.permissive {
+                log::warn!("{}", message);
+            } else {
+                return Err(anyhow!("{}", message));
+            }
+        }
         Ok(H::read(Cursor::new(header_buf))?)
     }
 
@@ -192,11 +202,16 @@ impl<'a, H: Header, P: Packet> BatchReader<'a, H, P> {
         // ... then verify the digest over it ...
         let packet_file_digest = sidecar_writer.sidecar.finish();
         if header.packet_file_digest().as_slice() != packet_file_digest.as_ref() {
-            return Err(anyhow!(
+            let message = format!(
                 "packet file digest in header {} does not match actual packet file digest {}",
                 hex_dump(header.packet_file_digest()),
                 hex_dump(packet_file_digest.as_ref())
-            ));
+            );
+            if self.permissive {
+                log::warn!("{}", message);
+            } else {
+                return Err(anyhow!("{}", message));
+            }
         }
 
         // pop() should always succeed here because sidecar_writers.writers is
@@ -492,6 +507,7 @@ mod tests {
             BatchReader::new(
                 Batch::new_ingestion(&aggregation_name, &batch_id, &date),
                 &mut read_transport,
+                false,
             );
         let base_path = format!(
             "{}/{}/{}",
@@ -561,6 +577,7 @@ mod tests {
             BatchReader::new(
                 Batch::new_validation(&aggregation_name, &batch_id, &date, is_first),
                 &mut read_transport,
+                false,
             );
         let base_path = format!(
             "{}/{}/{}",
@@ -642,6 +659,7 @@ mod tests {
             BatchReader::new(
                 Batch::new_sum(instance_name, &aggregation_name, &start, &end, is_first),
                 &mut read_transport,
+                false,
             );
         let batch_path = format!(
             "{}/{}/{}-{}",

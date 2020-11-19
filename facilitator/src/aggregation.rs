@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 pub struct BatchAggregator<'a> {
     is_first: bool,
+    permissive: bool,
     aggregation_name: &'a str,
     aggregation_start: &'a NaiveDateTime,
     aggregation_end: &'a NaiveDateTime,
@@ -34,6 +35,7 @@ impl<'a> BatchAggregator<'a> {
         aggregation_start: &'a NaiveDateTime,
         aggregation_end: &'a NaiveDateTime,
         is_first: bool,
+        permissive: bool,
         ingestion_transport: &'a mut VerifiableAndDecryptableTransport,
         own_validation_transport: &'a mut VerifiableTransport,
         peer_validation_transport: &'a mut VerifiableTransport,
@@ -41,6 +43,7 @@ impl<'a> BatchAggregator<'a> {
     ) -> Result<BatchAggregator<'a>> {
         Ok(BatchAggregator {
             is_first,
+            permissive,
             aggregation_name,
             aggregation_start,
             aggregation_end,
@@ -150,6 +153,7 @@ impl<'a> BatchAggregator<'a> {
             BatchReader::new(
                 Batch::new_ingestion(self.aggregation_name, batch_id, batch_date),
                 &mut *self.ingestion_transport.transport.transport,
+                self.permissive,
             );
         let ingestion_header = ingestion_batch
             .header(&self.ingestion_transport.transport.batch_signing_public_keys)?;
@@ -170,16 +174,19 @@ impl<'a> BatchAggregator<'a> {
             BatchReader::new(
                 Batch::new_ingestion(self.aggregation_name, batch_id, batch_date),
                 &mut *self.ingestion_transport.transport.transport,
+                self.permissive,
             );
         let mut own_validation_batch: BatchReader<'_, ValidationHeader, ValidationPacket> =
             BatchReader::new(
                 Batch::new_validation(self.aggregation_name, batch_id, batch_date, self.is_first),
                 &mut *self.own_validation_transport.transport,
+                self.permissive,
             );
         let mut peer_validation_batch: BatchReader<'_, ValidationHeader, ValidationPacket> =
             BatchReader::new(
                 Batch::new_validation(self.aggregation_name, batch_id, batch_date, !self.is_first),
                 &mut *self.peer_validation_transport.transport,
+                self.permissive,
             );
         let peer_validation_header = peer_validation_batch
             .header(&self.peer_validation_transport.batch_signing_public_keys)?;
