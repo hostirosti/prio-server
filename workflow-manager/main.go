@@ -144,8 +144,8 @@ var k8sNS = flag.String("k8s-namespace", "", "Kubernetes namespace")
 var isFirst = flag.Bool("is-first", false, "Whether this set of servers is \"first\", aka PHA servers")
 var maxAge = flag.String("intake-max-age", "1h", "Max age (in Go duration format) for intake batches to be worth processing.")
 var k8sServiceAccount = flag.String("k8s-service-account", "", "Kubernetes service account for intake and aggregate jobs")
-var bskSecretName = flag.String("bsk-secret-selector", "", "Label selector of k8s secret for batch signing key")
-var pdksSecretName = flag.String("pdks-secret-selector", "", "Label selector of k8s secret for packet decrypt keys")
+var bskSecretSelector = flag.String("bsk-secret-selector", "", "Label selector of k8s secret for batch signing key")
+var pdksSecretSelector = flag.String("pdks-secret-selector", "", "Label selector of k8s secret for packet decrypt keys")
 var gcpServiceAccountKeyFileSecretName = flag.String("gcp-service-account-key-file-secret-name", "", "Name of k8s secret for default GCP service account key file")
 var intakeConfigMap = flag.String("intake-batch-config-map", "", "Name of config map for intake jobs")
 var aggregateConfigMap = flag.String("aggregate-config-map", "", "Name of config map for aggregate jobs")
@@ -379,7 +379,7 @@ func (b *bucket) listFilesS3(ctx context.Context) ([]string, error) {
 	}
 	svc := s3.New(sess, config)
 	var output []string
-	var nextContinuationToken string = ""
+	var nextContinuationToken = ""
 	for {
 		input := &s3.ListObjectsV2Input{
 			// We choose a lower number than the default max of 1000 to ensure we exercise the
@@ -575,6 +575,72 @@ func secretVolumesAndMounts() ([]corev1.Volume, []corev1.VolumeMount) {
 	return volumes, volumeMounts
 }
 
+func getLatestBatchSigningKey(ctx context.Context, client *kubernetes.Clientset) (*corev1.Secret, error) {
+	secrets, err := getSecretsWithLabel(ctx, client, *bskSecretSelector)
+	if err != nil {
+		return nil, fmt.Errorf("bsks: %w", err)
+	}
+
+	if len(secrets) == 0 {
+		return nil, fmt.Errorf("secrets did not exist. %w", err)
+	}
+
+	// secrets with descending (older) creation dates
+	sort.Slice(secrets, func(i, j int) bool {
+		item1 := secrets[i]
+		item2 := secrets[j]
+
+		time1 := item1.GetCreationTimestamp().Time
+		time2 := item2.GetCreationTimestamp().Time
+
+		return time1.After(time2)
+	})
+
+	return &secrets[0], nil
+}
+
+func getAvailablePacketDecryptionKeys(ctx context.Context, client *kubernetes.Clientset) ([]corev1.Secret, error) {
+	return getSecretsWithLabel(ctx, client, *pdksSecretSelector)
+}
+
+func getSecretsWithLabel(ctx context.Context, client *kubernetes.Clientset, labelSelector string) ([]corev1.Secret, error) {
+	secrets, err := client.CoreV1().Secrets(*k8sNS).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("secrets with label %s: %w", labelSelector, err)
+	}
+
+	if secrets.Items == nil {
+		return nil, fmt.Errorf("pdks were nil after retrieving them from k8s")
+	}
+
+	return secrets.Items, nil
+}
+
+func getBSKAndPDKs(ctx context.Context, client *kubernetes.Clientset) (*corev1.Secret, *string, error) {
+	bsk, err := getLatestBatchSigningKey(context.Background(), client)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bsk: %w", err)
+	}
+
+	pdks, err := getAvailablePacketDecryptionKeys(context.Background(), client)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pdks: %w", err)
+	}
+
+	pdksStringArray := make([]string, len(pdks))
+	for _, pdk := range pdks {
+		data := pdk.Data["secret_key"]
+		if len(data) == 0 {
+			return nil, nil, fmt.Errorf("pdk did not contain secret_key")
+		}
+		pdksStringArray = append(pdksStringArray, string(data))
+	}
+
+	pdksDelimited := strings.Join(pdksStringArray, ",")
+
+	return bsk, &pdksDelimited, nil
+}
+
 func launchAggregationJobs(ctx context.Context, batchesByID aggregationMap, inter interval) error {
 	if len(batchesByID) == 0 {
 		log.Printf("no batches to aggregate")
@@ -588,6 +654,11 @@ func launchAggregationJobs(ctx context.Context, batchesByID aggregationMap, inte
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("clientset: %w", err)
+	}
+
+	bsk, pdks, err := getBSKAndPDKs(ctx, clientset)
+	if err != nil {
+		return fmt.Errorf("bsk and pdks: %w", err)
 	}
 
 	for _, readyBatches := range batchesByID {
@@ -661,22 +732,15 @@ func launchAggregationJobs(ctx context.Context, batchesByID aggregationMap, inte
 										ValueFrom: &corev1.EnvVarSource{
 											SecretKeyRef: &corev1.SecretKeySelector{
 												LocalObjectReference: corev1.LocalObjectReference{
-													Name: *bskSecretName,
+													Name: bsk.Name,
 												},
 												Key: "secret_key",
 											},
 										},
 									},
 									{
-										Name: "PACKET_DECRYPTION_KEYS",
-										ValueFrom: &corev1.EnvVarSource{
-											SecretKeyRef: &corev1.SecretKeySelector{
-												LocalObjectReference: corev1.LocalObjectReference{
-													Name: *pdksSecretName,
-												},
-												Key: "secret_key",
-											},
-										},
+										Name:  "PACKET_DECRYPTION_KEYS",
+										Value: *pdks,
 									},
 								},
 							},
@@ -713,9 +777,14 @@ func launchIntake(ctx context.Context, readyBatches []*batchPath, ageLimit time.
 		return fmt.Errorf("clientset: %w", err)
 	}
 
+	bsk, pdks, err := getBSKAndPDKs(ctx, clientset)
+	if err != nil {
+		return fmt.Errorf("bsk and pdks: %w", err)
+	}
+
 	log.Printf("starting %d jobs", len(readyBatches))
 	for _, batch := range readyBatches {
-		if err := startIntakeJob(ctx, clientset, batch, ageLimit); err != nil {
+		if err := startIntakeJob(ctx, clientset, batch, ageLimit, bsk, *pdks); err != nil {
 			return fmt.Errorf("starting job for batch %s: %w", batch, err)
 		}
 		intakesStarted.Inc()
@@ -728,6 +797,8 @@ func startIntakeJob(
 	clientset *kubernetes.Clientset,
 	batchPath *batchPath,
 	ageLimit time.Duration,
+	batchSigningKey *corev1.Secret,
+	packetDecryptionDelimited string,
 ) error {
 	age := time.Now().Sub(batchPath.time)
 	if age > ageLimit {
@@ -791,22 +862,15 @@ func startIntakeJob(
 									ValueFrom: &corev1.EnvVarSource{
 										SecretKeyRef: &corev1.SecretKeySelector{
 											LocalObjectReference: corev1.LocalObjectReference{
-												Name: *bskSecretName,
+												Name: batchSigningKey.Name,
 											},
 											Key: "secret_key",
 										},
 									},
 								},
 								{
-									Name: "PACKET_DECRYPTION_KEYS",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: *pdksSecretName,
-											},
-											Key: "secret_key",
-										},
-									},
+									Name:  "PACKET_DECRYPTION_KEYS",
+									Value: packetDecryptionDelimited,
 								},
 							},
 						},
